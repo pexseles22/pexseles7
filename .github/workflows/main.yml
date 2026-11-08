@@ -1,0 +1,257 @@
+# ==============================================
+#  TECH Decode - Free Cloud PC (Windows + RustDesk + Tailscale)
+#  Created by TECH Decode
+#  Powered by Tailscale and RustDesk
+# ==============================================
+name: TECH Decode - Free Cloud PC (Windows)
+
+env:
+  BRAND_NAME: "TECH Decode"
+  BRAND_URL: ""   # apni website ka link yahan likhein (khali chhor sakte hain)
+
+on:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: "Install karne wali apps (space se alag, Chocolatey ke naam)"
+        required: false
+        default: "vlc 7zip notepadplusplus"
+
+jobs:
+  remote:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: TECH Decode Credits
+        run: |
+          Write-Host "=============================================="
+          Write-Host "   $env:BRAND_NAME - Free Cloud PC"
+          Write-Host "   Created and shared by $env:BRAND_NAME"
+          if ($env:BRAND_URL) { Write-Host "   More guides: $env:BRAND_URL" }
+          Write-Host "   Powered by Tailscale and RustDesk"
+          Write-Host "=============================================="
+
+          $summary = "## $env:BRAND_NAME - Free Cloud PC`nCreated and shared by **$env:BRAND_NAME**.`n`nPowered by Tailscale and RustDesk."
+          if ($env:BRAND_URL) { $summary += "`n`nMore guides: $env:BRAND_URL" }
+          $summary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = Join-Path $env:TEMP "tailscale-setup.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale Connection
+        env:
+          TS_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          & $tsExe up --authkey=$env:TS_KEY --accept-dns=false --hostname="gh-runner-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & $tsExe ip -4
+              if (-not $tsIP) { Start-Sleep -Seconds 5 }
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Install and Configure RustDesk
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest"
+          $asset = $release.assets | Where-Object { $_.name -like "rustdesk-*-x86_64.exe" } | Select-Object -First 1
+          Write-Host "Downloading: $($asset.name)"
+
+          $exe = Join-Path $env:TEMP "rustdesk-setup.exe"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $exe
+
+          # -Wait nahi lagana, installer ko background mein chalne do
+          Start-Process $exe -ArgumentList "--silent-install"
+
+          # Install hone ka intezar (max 3 minute)
+          $rd = Join-Path $env:ProgramFiles "RustDesk\rustdesk.exe"
+          for ($i = 1; $i -le 36; $i++) {
+              if ((Test-Path $rd) -and (Get-Service -Name RustDesk -ErrorAction SilentlyContinue)) { break }
+              Write-Host "Install ka intezar ($i/36)..."
+              Start-Sleep -Seconds 5
+          }
+
+          if (-not (Test-Path $rd)) {
+              Write-Error "RustDesk install nahi hua"
+              exit 1
+          }
+          Write-Host "RustDesk install ho gaya"
+
+          # Service chalne aur ID milne ka intezar (settings tab hi lagti hain jab RustDesk ready ho)
+          $rdId = ""
+          for ($i = 1; $i -le 24; $i++) {
+              $svc = Get-Service -Name RustDesk -ErrorAction SilentlyContinue
+              if ($svc -and $svc.Status -eq "Running") {
+                  $rdId = "$(& $rd --get-id | Write-Output)".Trim()
+                  if ($rdId -match '^\d{6,}$') { break }
+              }
+              Write-Host "RustDesk ready hone ka intezar ($i/24)..."
+              Start-Sleep -Seconds 5
+          }
+          Write-Host "RustDesk ID: $rdId"
+          echo "RD_ID=$rdId" >> $env:GITHUB_ENV
+
+          $password = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
+          echo "RD_PASS=$password" >> $env:GITHUB_ENV
+
+          # Firewall
+          netsh advfirewall firewall delete rule name="RustDesk-Direct"
+          netsh advfirewall firewall add rule name="RustDesk-Direct" dir=in action=allow protocol=TCP localport=21118 remoteip=100.64.0.0/10
+          netsh advfirewall firewall add rule name="RustDesk-App" dir=in action=allow program="$rd" enable=yes
+
+          # Settings lagao aur check karo ke port 21118 khula ya nahi (max 5 koshish)
+          $listening = $false
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+              Write-Host "Settings attempt $attempt/5"
+
+              # "| Write-Output" lagane se PowerShell command ke khatam hone ka intezar karta hai
+              & $rd --option direct-server Y | Write-Output
+              & $rd --option approve-mode password | Write-Output
+              & $rd --password $password | Write-Output
+              Start-Sleep -Seconds 3
+
+              if ($attempt -ge 2) {
+                  # Backup tareeqa: config file seedhi likho
+                  Stop-Service -Name RustDesk -Force -ErrorAction SilentlyContinue
+                  Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force
+                  $toml = "[options]`ndirect-server = 'Y'`napprove-mode = 'password'`n"
+                  $dirs = @("C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config", "$env:APPDATA\RustDesk\config")
+                  foreach ($d in $dirs) {
+                      New-Item -ItemType Directory -Path $d -Force | Out-Null
+                      Set-Content -Path (Join-Path $d "RustDesk2.toml") -Value $toml -Encoding ascii
+                  }
+                  Start-Service -Name RustDesk
+              } else {
+                  Restart-Service -Name RustDesk -Force
+              }
+
+              for ($j = 1; $j -le 8; $j++) {
+                  Start-Sleep -Seconds 3
+                  if (Get-NetTCPConnection -LocalPort 21118 -State Listen -ErrorAction SilentlyContinue) { $listening = $true; break }
+              }
+              if ($listening) { Write-Host "Port 21118 khul gaya (attempt $attempt)"; break }
+              Write-Host "Port abhi band hai, dobara koshish..."
+          }
+
+          if (-not $listening) { Write-Host "WARNING: Port 21118 khula nahi. RustDesk ID se connect karne ki koshish karein." }
+          Write-Host "RustDesk configure ho gaya"
+
+      - name: Install My Apps
+        env:
+          APPS: ${{ inputs.apps }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:APPS)) {
+              Write-Host "Koi app list nahi di, skip."
+              exit 0
+          }
+
+          $apps = $env:APPS -split '[\s,]+' | Where-Object { $_ }
+          $failed = @()
+
+          foreach ($app in $apps) {
+              Write-Host "=== Installing: $app ==="
+              choco install $app -y --no-progress
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "FAILED: $app"
+                  $failed += $app
+              }
+          }
+
+          Write-Host "=== Install summary ==="
+          Write-Host "Total: $($apps.Count) | Failed: $($failed.Count)"
+          if ($failed.Count -gt 0) { Write-Host "Failed apps: $($failed -join ', ')" }
+          exit 0
+
+      - name: Apply TECH Decode Branding
+        continue-on-error: true
+        run: |
+          Add-Type -AssemblyName System.Drawing
+
+          $w = 1920
+          $h = 1080
+          $bmp = New-Object System.Drawing.Bitmap $w, $h
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAlias
+          $g.Clear([System.Drawing.Color]::FromArgb(15, 23, 42))
+
+          $fmt = New-Object System.Drawing.StringFormat
+          $fmt.Alignment = [System.Drawing.StringAlignment]::Center
+          $fmt.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+          $f1 = New-Object System.Drawing.Font("Segoe UI", 72, [System.Drawing.FontStyle]::Bold)
+          $f2 = New-Object System.Drawing.Font("Segoe UI", 28)
+          $r1 = New-Object System.Drawing.RectangleF 0, 420, $w, 150
+          $r2 = New-Object System.Drawing.RectangleF 0, 580, $w, 60
+
+          $g.DrawString($env:BRAND_NAME, $f1, [System.Drawing.Brushes]::White, $r1, $fmt)
+          $g.DrawString("Free Cloud PC - Created by $env:BRAND_NAME", $f2, [System.Drawing.Brushes]::LightGray, $r2, $fmt)
+          $g.Dispose()
+
+          $path = Join-Path $env:PUBLIC "techdecode-wallpaper.png"
+          $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+          $bmp.Dispose()
+
+          Set-ItemProperty -Path "HKCU:\Control Panel\Desktop" -Name Wallpaper -Value $path
+
+          Add-Type -TypeDefinition @'
+          using System.Runtime.InteropServices;
+          public class TDWall {
+              [DllImport("user32.dll", CharSet = CharSet.Auto)]
+              public static extern int SystemParametersInfo(int a, int b, string c, int d);
+          }
+          '@
+          [TDWall]::SystemParametersInfo(20, 0, $path, 3) | Out-Null
+
+          # Desktop par credit wali note file
+          $note = "$env:BRAND_NAME - Free Cloud PC`r`nCreated and shared by $env:BRAND_NAME.`r`nPowered by Tailscale and RustDesk.`r`n"
+          if ($env:BRAND_URL) { $note += "More guides: $env:BRAND_URL`r`n" }
+          Set-Content -Path (Join-Path $env:PUBLIC "Desktop\TECH Decode - READ ME.txt") -Value $note
+          Write-Host "Branding lag gayi"
+
+      - name: Verify RustDesk Port
+        run: |
+          $ok = $false
+          for ($i = 1; $i -le 12; $i++) {
+              $conn = Get-NetTCPConnection -LocalPort 21118 -State Listen -ErrorAction SilentlyContinue
+              if ($conn) { $ok = $true; break }
+              Write-Host "Port 21118 abhi listen nahi kar raha, dobara check ($i/12)..."
+              Start-Sleep -Seconds 5
+          }
+
+          if ($ok) {
+              Write-Host "Port 21118 LISTENING - connection ke liye tayyar"
+          } else {
+              Write-Host "WARNING: Port 21118 listen nahi kar raha. RustDesk service ka status:"
+              Get-Service -Name RustDesk | Format-List *
+              Get-Process rustdesk -ErrorAction SilentlyContinue | Format-Table
+          }
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "=== $env:BRAND_NAME - RUSTDESK ACCESS ==="
+          Write-Host "Address (Tailscale IP): $env:TAILSCALE_IP"
+          Write-Host "RustDesk ID (backup): $env:RD_ID"
+          Write-Host "Password: $env:RD_PASS"
+          Write-Host "Created by $env:BRAND_NAME"
+          Write-Host "======================="
+
+          while ($true) {
+              Write-Host "[$(Get-Date)] RustDesk Active"
+              Start-Sleep -Seconds 300
+          }
